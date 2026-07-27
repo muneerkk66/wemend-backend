@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv*/
+.env
+*.log
+audio/
+*.wav
+.hf/
+.claude/
+.DS_Store
