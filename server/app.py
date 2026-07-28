@@ -151,10 +151,12 @@ app = FastAPI(title="WeMendAI Voice API")
 
 
 # Routers. Auth first so it is obvious it does not depend on the models.
-from .routers import auth as auth_router      # noqa: E402
-from .routers import voice as voice_router    # noqa: E402
+from .routers import auth as auth_router        # noqa: E402
+from .routers import profile as profile_router  # noqa: E402
+from .routers import voice as voice_router      # noqa: E402
 
 app.include_router(auth_router.router)
+app.include_router(profile_router.router)
 app.include_router(voice_router.router)
 
 # Authentication is default-deny by construction: every route in the routers above
