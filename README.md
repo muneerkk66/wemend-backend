@@ -49,6 +49,34 @@ cd server && HF_HOME=/workspace/.hf PYTHONPATH=/workspace/csm:. \
 `/health` answers immediately while models load in a background thread (CSM ~45 s,
 Whisper ~2 min). Poll it for `"ready": true`.
 
+## Stopping and resuming the pod
+
+**Stop the pod, don't terminate it.** Stopping halts GPU billing (~$248/mo → ~$5–18/mo
+storage). Terminating destroys the volume, and that means re-downloading 26 GB of CSM
+weights and 11 GB of Ollama blobs.
+
+Note RunPod bills **stopped** storage at double: $0.20/GB/month vs $0.10 running.
+
+What survives a stop (the volume), and what doesn't (the container disk):
+
+| Path | Survives? | Rebuild cost |
+|---|---|---|
+| `/workspace/.hf` (26 GB weights) | ✅ | — |
+| `/workspace/.ollama` (11 GB blobs) | ✅ | — |
+| `/workspace/{csm,server,infra}` | ✅ | — |
+| `/opt/venv-voice` | ❌ | ~5 min (pip) |
+| `/opt/ollama` (local blob copy) | ❌ | ~5 s (`cp` from volume) |
+| `ollama` binary, apt packages | ❌ | ~1 min |
+
+After restarting, one command restores all of it and starts both services:
+
+```bash
+bash /workspace/infra/resume.sh
+```
+
+It's idempotent, so it doubles as a health check. If the **pod id** changed, update
+`Config.swift` in `wemend-ios` — the app's URL is `https://<pod-id>-8888.proxy.runpod.net`.
+
 ## Endpoints
 
 | Method | Path | Purpose |
