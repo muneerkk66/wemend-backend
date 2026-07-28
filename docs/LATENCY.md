@@ -1,4 +1,53 @@
-# Measured latency — RTX 4090 (24 GB), RunPod
+# Measured latency — RunPod
+
+Two GPUs measured, because a pod restart lost the 4090 and RunPod reallocated a
+Blackwell card. Both sets of numbers are from the real pods, warm.
+
+| | RTX 4090 (24 GB) | RTX PRO 4500 Blackwell (32 GB) |
+|---|---|---|
+| Warm turn (Kokoro) | ~3.5 s | **~2.1 s** |
+| Gemma 4 warm | 1.7 s | **1.5 s** |
+| CSM | 0.43× realtime | **0.47–0.53×** |
+| Kokoro | ~110 ms | **~85 ms** |
+| Model load (all 4) | 171 s | **37 s** |
+| Cold Gemma load | ~10 s (local disk) | **~100 s** (blobs on MooseFS) |
+
+Blackwell is ~20% faster across the board *and* has 8 GB more VRAM, with one
+regression: a cu128 torch is large enough that a 20 GB container disk can't hold it
+**and** the 11 GB of Ollama blobs, so the blobs stay on the network volume and the
+first LLM call after a restart pays ~100 s to read 9 GB over MooseFS. Warm calls are
+unaffected. Fix by provisioning a larger container disk (≥40 GB) at pod creation.
+
+## Blackwell (sm_120) requires a torch upgrade — and the failure is silent
+
+The RunPod image ships **torch 2.4.1+cu124**, whose kernels stop at `sm_90`.
+On Blackwell every CUDA op dies with *"no kernel image is available for execution on
+the device"* — but **`torch.cuda.is_available()` still returns `True`**, so a naive
+health check sails straight past it. Only launching a real kernel detects this.
+
+Working combination, found the hard way:
+
+```
+torch==2.9.1+cu128   torchaudio==2.9.1+cu128   torchvision==0.24.1+cu128
+torchcodec==0.9.*    moshi>=0.2.13
+```
+
+Four traps, in the order they bite:
+1. **The trio must match exactly** (shared C++ ABI). Mismatched torchaudio →
+   `undefined symbol: torch_library_impl`; mismatched torchvision →
+   `operator torchvision::nms does not exist`, which breaks `transformers` and so
+   breaks Kokoro.
+2. **`moshi 0.2.2` pins `torch<2.7`** — irreconcilable with Blackwell. Needs ≥0.2.13.
+   Install torch **last**, with `--no-deps`, or resolving moshi silently drags torch
+   to another version and re-breaks the ABI.
+3. **The stale packages are in the *image*'s site-packages**, not the venv, so
+   `pip uninstall` reports "no files found". Installing into the venv shadows them.
+4. **`torchaudio ≥2.9` dropped its own decoders** and delegates `load()` to
+   `torchcodec`. CSM calls `torchaudio.load`/`save` directly, so it is not optional.
+
+## Original 4090 measurements
+
+
 
 Everything here was measured on the actual pod, warm, not taken from a vendor
 benchmark. Re-measure before trusting any of it on different hardware.

@@ -115,9 +115,42 @@ else
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
   pip install -q --upgrade pip wheel
-  python -c 'import torch;assert torch.cuda.is_available()' || die "torch cannot see CUDA"
+  # cuda.is_available() is NOT sufficient: on the Blackwell pod it returned True
+  # while every kernel launch failed with "no kernel image is available for
+  # execution on the device". Only an actual kernel proves the build matches the arch.
+  python - <<'PYCHK' || die "torch cannot run kernels on this GPU — see the arch note below"
+import sys, torch
+cap = torch.cuda.get_device_capability(0)
+arch = f"sm_{cap[0]}{cap[1]}"
+if arch not in torch.cuda.get_arch_list():
+    print(f"  torch {torch.__version__} has no {arch} kernels (has {torch.cuda.get_arch_list()})")
+    sys.exit(1)
+torch.randn(64, 64, device="cuda").mul(2).sum().item()   # force a real launch
+print(f"  torch {torch.__version__} runs kernels on {arch}")
+PYCHK
   pip install -q faster-whisper "huggingface_hub[cli]" moshi torchtune torchao \
                  fastapi "uvicorn[standard]" python-multipart httpx kokoro soundfile
+
+  # --- GPU-architecture fixup -------------------------------------------------
+  # The RunPod image ships torch 2.4.1+cu124, whose kernels stop at sm_90. A pod
+  # that comes back on Blackwell (sm_120, e.g. RTX PRO 4500) then fails EVERY CUDA
+  # op with "no kernel image is available", while cuda.is_available() still says
+  # True. Detect the arch and install a matching build.
+  CAP=$(python -c 'import torch;c=torch.cuda.get_device_capability(0);print(f"sm_{c[0]}{c[1]}")' 2>/dev/null || echo unknown)
+  HAVE=$(python -c 'import torch;print(" ".join(torch.cuda.get_arch_list()))' 2>/dev/null || echo "")
+  if [ "$CAP" != "unknown" ] && ! echo "$HAVE" | grep -qw "$CAP"; then
+    echo "  GPU is $CAP but torch only has: $HAVE — installing cu128 build"
+    # These three share a C++ ABI and MUST match exactly. Mismatches give
+    # "undefined symbol: torch_library_impl" (torchaudio) or
+    # "operator torchvision::nms does not exist" (torchvision, breaks transformers).
+    # --no-deps so resolving moshi cannot silently drag torch to another version.
+    pip install -q --force-reinstall --no-deps \
+      --index-url https://download.pytorch.org/whl/cu128 \
+      torch==2.9.1 torchaudio==2.9.1 torchvision==0.24.1
+    # torchaudio >=2.9 dropped its own decoders and delegates load() to torchcodec.
+    pip install -q "torchcodec==0.9.*"
+    echo "  installed matched trio + torchcodec for $CAP"
+  fi
   # CSM's own requirements, minus the torch pins that would replace the image's
   # working CUDA build.
   grep -viE '^(torch|torchaudio)([=<>~!]|$)' "$WORK/csm/requirements.txt" > /tmp/csm-reqs.txt
@@ -135,7 +168,10 @@ if [ -d "$OLLAMA_LOCAL/blobs" ]; then
 else
   need=$(du -sm "$WORK/.ollama" | cut -f1)
   free=$(df -m / | awk 'NR==2{print $4}')
-  if [ "$free" -lt $((need + 2048)) ]; then
+  # Reserve 8GB, not 2: a cu128 torch plus its NVIDIA libs is far larger than the
+  # image's cu124 build. Copying blobs first is what starved the torch install and
+  # produced "No space left on device" on a 20GB container disk.
+  if [ "$free" -lt $((need + 8192)) ]; then
     echo "  !! only ${free}MB free on / but need ~${need}MB — staying on the volume."
     echo "     Expect TTFT ~1.8s instead of ~1.1s. Raise the pod's container disk to fix."
     OLLAMA_LOCAL="$WORK/.ollama"
