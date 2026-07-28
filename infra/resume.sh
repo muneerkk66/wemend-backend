@@ -27,6 +27,16 @@ VENV=/opt/venv-voice
 OLLAMA_LOCAL=/opt/ollama
 PORT="${PORT:-8888}"          # 8888 is proxied by default RunPod pods; see README
 
+# Wheels cached on the VOLUME so a container-disk wipe doesn't re-download ~500MB.
+# The venv itself stays on the container disk deliberately — on /workspace it took
+# 34 min for 62 packages, and it costs a permanent ~40% on Gemma TTFT because
+# llama.cpp mmaps the GGUF and page-faults over the network. Cache the downloads,
+# not the installed tree.
+export PIP_CACHE_DIR="$WORK/.pipcache"
+# authorized_keys lives on the container disk, so a stop wipes SSH access and locks
+# you out of the very box you need to fix. Keep a copy on the volume.
+SSH_BACKUP="$WORK/.ssh/authorized_keys"
+
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 die() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
@@ -36,7 +46,54 @@ pod was TERMINATED rather than stopped. If terminated, re-run:
     bash $WORK/infra/runpod_bootstrap.sh phase1
     HF_TOKEN=hf_xxx bash $WORK/infra/runpod_bootstrap.sh phase2"
 [ -d "$WORK/.ollama/blobs" ] || die "$WORK/.ollama missing — re-run bootstrap phase1"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || die "no GPU"
+
+log "Restoring SSH access if the wipe took it"
+# Do this BEFORE the GPU check: if the GPU is missing you still want to be able to
+# get back in over SSH to investigate, rather than being stuck in a web terminal.
+mkdir -p "$WORK/.ssh" "$HOME/.ssh"; chmod 700 "$WORK/.ssh" "$HOME/.ssh"
+if [ -s "$SSH_BACKUP" ]; then
+  # Merge rather than overwrite, and de-dupe, so a key added by either side survives.
+  cat "$SSH_BACKUP" "$HOME/.ssh/authorized_keys" 2>/dev/null \
+    | sort -u | grep -v '^[[:space:]]*$' > /tmp/ak.merged
+  install -m 600 /tmp/ak.merged "$HOME/.ssh/authorized_keys"
+  echo "  restored $(wc -l < "$HOME/.ssh/authorized_keys") key(s) from the volume"
+elif [ -s "$HOME/.ssh/authorized_keys" ]; then
+  install -m 600 "$HOME/.ssh/authorized_keys" "$SSH_BACKUP"
+  echo "  backed up $(wc -l < "$SSH_BACKUP") key(s) to the volume for next restart"
+else
+  echo "  !! no authorized_keys anywhere. Add your key now or the next stop locks you out:"
+  echo "     echo '<your-public-key>' >> $SSH_BACKUP"
+fi
+
+log "GPU"
+# Diagnose properly. A restarted pod can come back with the host driver visible but
+# no GPU passed through to the container, which is what happened on 2026-07-28: the
+# old check just printed "no GPU" and gave no clue where to look.
+if [ ! -e /dev/nvidiactl ] && ! ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
+  printf '\n\033[1;31m'
+  echo "No GPU in this container."
+  if [ -r /proc/driver/nvidia/version ]; then
+    echo "  The HOST driver is present ($(sed -n 's/.*Kernel Module *\([0-9.]*\).*/\1/p' /proc/driver/nvidia/version))"
+    echo "  but no /dev/nvidia* devices are mapped in — the GPU was not passed"
+    echo "  through when the pod started."
+  else
+    echo "  No host driver either."
+  fi
+  printf '\033[0m'
+  cat <<'EOG'
+
+  Fix in the RunPod dashboard (nothing here can attach a GPU):
+    1. Stop the pod, then Start it again — RunPod may reallocate.
+    2. If it comes back without a GPU, terminate and create a NEW pod attached to
+       the SAME network volume. /workspace is mfs#...runpod.net (a network volume),
+       so it survives termination and you lose none of the 51GB of weights.
+
+EOG
+  exit 1
+fi
+command -v nvidia-smi >/dev/null \
+  && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
+  || echo "  devices present but nvidia-smi missing (unusual — torch may still work)"
 
 log "System packages"
 if ! command -v ffmpeg >/dev/null || ! command -v zstd >/dev/null; then
@@ -53,6 +110,7 @@ log "Python venv ($VENV — container disk, NOT the volume: see docs/LATENCY.md)
 if [ -x "$VENV/bin/python" ]; then
   echo "  already present"
 else
+  echo "  (pip cache on the volume: $PIP_CACHE_DIR — no re-download after a wipe)"
   python3 -m venv "$VENV" --system-site-packages
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
@@ -122,6 +180,9 @@ curl -s "http://127.0.0.1:$PORT/health"; echo ""
 grep -a 'tts:csm\|\[models\]' /var/log/wemendai.log | tail -3
 
 cat <<EOF
+
+  pip cache on volume: $(du -sh "$PIP_CACHE_DIR" 2>/dev/null | cut -f1 || echo 0)
+  SSH keys backed up:  $SSH_BACKUP
 
   READY. Public URL (RunPod proxies :$PORT):
     https://<pod-id>-$PORT.proxy.runpod.net/health
