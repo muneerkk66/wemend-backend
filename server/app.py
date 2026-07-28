@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -33,8 +34,7 @@ import httpx
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 
 import tts as tts_mod
@@ -112,13 +112,47 @@ class Session:
     id: str
     speaker: str
     listener: str
+    # Bearer secret returned once at creation and required by every other endpoint.
+    # A stopgap until Phase 1 replaces it with real Apple-backed auth: it stops the
+    # session id alone (which appears in URLs and logs) from granting access.
+    secret: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     turns: list[Turn] = field(default_factory=list)
     # Set when the speaker's side is distilled and awaiting their approval.
     pending_relay: dict | None = None
+    # Audio ids this session produced. /audio is scoped to this set, so a guessed
+    # id no longer yields another person's relay audio.
+    audio_ids: set[str] = field(default_factory=set)
     created: float = field(default_factory=time.time)
 
 
 SESSIONS: dict[str, Session] = {}
+
+
+# ────────────────────────────────── auth ────────────────────────────────────
+def authed_session(
+    session_id: str = Form(...),
+    authorization: str | None = Header(None),
+) -> Session:
+    """Resolve a session from its id AND its bearer secret.
+
+    Every mutating endpoint depends on this. Previously they took a bare
+    session_id, so anyone holding an id could read another person's pending relay
+    draft and voice it. Compared with compare_digest to avoid leaking the secret
+    through timing.
+    """
+    s = SESSIONS.get(session_id)
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    # Same error whether the session is unknown or the secret is wrong — a
+    # distinguishable 404 would confirm which session ids exist.
+    if s is None or not token or not secrets.compare_digest(token, s.secret):
+        raise HTTPException(403, "invalid session or token")
+    return s
+
+
+def register_audio(s: Session, audio_id: str) -> None:
+    s.audio_ids.add(audio_id)
 
 
 # ────────────────────────────────── helpers ─────────────────────────────────
@@ -184,10 +218,9 @@ async def speak(text: str, speaker_id: int = 0, engine: str = None) -> tuple[str
 # ──────────────────────────────────── app ──────────────────────────────────
 app = FastAPI(title="WeMendAI Voice API")
 
-# The iOS app talks to this over the RunPod proxy; tighten before any real users.
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+# No CORS middleware on purpose. A native iOS client sends no Origin header and
+# does not need CORS; the previous allow_origins=["*"] only made the API callable
+# from any web page. Add a narrow allowlist here if a browser client ever exists.
 
 
 @app.on_event("startup")
@@ -212,21 +245,21 @@ async def health() -> dict:
 async def create_session(speaker: str = Form(...), listener: str = Form(...)) -> dict:
     s = Session(id=uuid.uuid4().hex, speaker=speaker, listener=listener)
     SESSIONS[s.id] = s
-    return {"session_id": s.id, "speaker": s.speaker, "listener": s.listener}
+    # The secret is returned exactly once. Clients must send it as
+    # `Authorization: Bearer <secret>` on every other call.
+    return {"session_id": s.id, "session_secret": s.secret,
+            "speaker": s.speaker, "listener": s.listener}
 
 
 @app.post("/turn")
 async def turn(
-    session_id: str = Form(...),
     audio: UploadFile = File(...),
     voice: str = Form(None),
+    s: Session = Depends(authed_session),
 ) -> JSONResponse:
     """One conversational turn: the speaker talks to the AI, the AI answers aloud."""
     if not M.ready:
         raise HTTPException(503, "models still loading — poll /health")
-    s = SESSIONS.get(session_id)
-    if s is None:
-        raise HTTPException(404, "unknown session")
 
     raw = await audio.read()
     suffix = os.path.splitext(audio.filename or "a.m4a")[1] or ".m4a"
@@ -250,6 +283,7 @@ async def turn(
     s.turns.append(Turn("assistant", reply))
 
     aid, dur, tstats = await speak(reply, 0, voice)
+    register_audio(s, aid)
 
     return JSONResponse({
         "heard": heard,
@@ -267,7 +301,7 @@ async def turn(
 
 
 @app.post("/distill")
-async def distill(session_id: str = Form(...)) -> dict:
+async def distill(s: Session = Depends(authed_session)) -> dict:
     """Shuttle step: turn this speaker's session into a message for the partner.
 
     Returns the draft WITHOUT voicing it. The speaker must approve via /approve —
@@ -275,9 +309,6 @@ async def distill(session_id: str = Form(...)) -> dict:
     """
     if not M.ready:
         raise HTTPException(503, "models still loading")
-    s = SESSIONS.get(session_id)
-    if s is None:
-        raise HTTPException(404, "unknown session")
 
     said = " ".join(t.text for t in s.turns if t.role == "user")
     if not said:
@@ -304,24 +335,47 @@ async def distill(session_id: str = Form(...)) -> dict:
 
 
 @app.post("/approve")
-async def approve(session_id: str = Form(...), edited_relay: str = Form(None),
-                  voice: str = Form(None)) -> dict:
+async def approve(edited_relay: str = Form(None), voice: str = Form(None),
+                  s: Session = Depends(authed_session)) -> dict:
     """Speaker approves (optionally edits) the relay; only then is it voiced."""
-    s = SESSIONS.get(session_id)
-    if s is None or s.pending_relay is None:
+    if s.pending_relay is None:
         raise HTTPException(404, "no pending relay for this session")
 
     text = (edited_relay or s.pending_relay["relay"]).strip()
     aid, dur, tstats = await speak(text, 1, voice)   # distinct voice for the relay
+    register_audio(s, aid)
     s.pending_relay = None
     return {"relay_text": text, "audio_url": f"/audio/{aid}",
             "audio_seconds": round(dur, 2), "tts": tstats}
 
 
 @app.get("/audio/{audio_id}")
-async def get_audio(audio_id: str) -> FileResponse:
+async def get_audio(
+    audio_id: str,
+    session_id: str = "",
+    authorization: str | None = Header(None),
+) -> FileResponse:
+    """Fetch generated audio. Scoped to the session that produced it.
+
+    This was the sharpest hole in the service: the only check was isalnum(), so any
+    wav ever generated — including approved relay audio — was readable by guessing a
+    32-hex id on a public URL. Now the caller must prove they own the session that
+    created it. session_id is a query param because <audio> tags cannot set headers,
+    so the client appends ?session_id=...; the bearer secret still travels in the
+    header and is what actually authorises.
+    """
     if not audio_id.isalnum():                  # no path traversal
         raise HTTPException(400, "bad id")
+
+    s = SESSIONS.get(session_id)
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if s is None or not token or not secrets.compare_digest(token, s.secret):
+        raise HTTPException(403, "invalid session or token")
+    if audio_id not in s.audio_ids:
+        raise HTTPException(403, "audio does not belong to this session")
+
     path = os.path.join(AUDIO_DIR, f"{audio_id}.wav")
     if not os.path.exists(path):
         raise HTTPException(404, "expired or unknown audio")
