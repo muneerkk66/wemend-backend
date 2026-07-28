@@ -9,3 +9,10 @@ audio/
 .hf/
 .claude/
 .DS_Store
+
+# local dev
+.venv/
+.pytest_cache/
+__pycache__/
+# Apple Sign in private key — NEVER commit
+*.p8
