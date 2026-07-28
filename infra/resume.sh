@@ -129,7 +129,8 @@ torch.randn(64, 64, device="cuda").mul(2).sum().item()   # force a real launch
 print(f"  torch {torch.__version__} runs kernels on {arch}")
 PYCHK
   pip install -q faster-whisper "huggingface_hub[cli]" moshi torchtune torchao \
-                 fastapi "uvicorn[standard]" python-multipart httpx kokoro soundfile
+                 fastapi "uvicorn[standard]" python-multipart httpx kokoro soundfile \
+                 "sqlalchemy[asyncio]>=2.0" asyncpg alembic "pyjwt[crypto]>=2.10" cryptography
 
   # --- GPU-architecture fixup -------------------------------------------------
   # The RunPod image ships torch 2.4.1+cu124, whose kernels stop at sm_90. A pod
@@ -182,6 +183,20 @@ else
   fi
 fi
 
+log "Postgres (control plane) + restore from the volume if the disk was wiped"
+# The datadir is on the container disk because Postgres over MooseFS risks corruption,
+# so a stop destroys it; pg_setup.sh restores the newest pg_dump from /workspace.
+# ACCOUNTS LIVE HERE — run infra/pg_dump.sh before stopping the pod.
+if [ -x "$WORK/infra/pg_setup.sh" ]; then
+  bash "$WORK/infra/pg_setup.sh" || die "Postgres did not come up"
+  if [ -f "$WORK/.secrets/wemend.env" ]; then
+    set -a; . "$WORK/.secrets/wemend.env"; set +a
+    (cd "$WORK" && "$VENV/bin/alembic" upgrade head 2>&1 | tail -1 | sed 's/^/  /') || true
+  fi
+else
+  echo "  (pg_setup.sh absent — running without the control plane)"
+fi
+
 log "Starting Ollama (resident, logging to LOCAL disk)"
 # KEEP_ALIVE=-1: the default 5-min unload costs ~30s on the next request.
 # Log to /var/log, NOT the volume: a stale network-storage fd killed llama-server
@@ -200,9 +215,13 @@ echo ""
 log "Starting the API on :$PORT"
 PIDS=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u || true)
 [ -n "$PIDS" ] && { kill $PIDS 2>/dev/null || true; sleep 3; }
-cd "$WORK/server"
-setsid nohup env HF_HOME="$WORK/.hf" PYTHONPATH="$WORK/csm:$WORK/server" \
-  "$VENV/bin/python" -m uvicorn app:app --host 0.0.0.0 --port "$PORT" \
+cd "$WORK"
+# Runs as a package (server.app) since the routers split; a flat `uvicorn app:app`
+# breaks the relative imports. Secrets come from the volume so they survive a wipe.
+ENVARGS=""
+[ -f "$WORK/.secrets/wemend.env" ] && ENVARGS=$(grep -v '^#' "$WORK/.secrets/wemend.env" | xargs)
+setsid nohup env $ENVARGS HF_HOME="$WORK/.hf" PYTHONPATH="$WORK/csm:$WORK" \
+  "$VENV/bin/python" -m uvicorn server.app:app --host 0.0.0.0 --port "$PORT" \
   > /var/log/wemendai.log 2>&1 < /dev/null &
 
 log "Waiting for models (CSM ~40s, Whisper ~2min on a cold volume)"
