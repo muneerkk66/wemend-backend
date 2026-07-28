@@ -16,3 +16,5 @@ audio/
 __pycache__/
 # Apple Sign in private key — NEVER commit
 *.p8
+
+.env
