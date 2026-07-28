@@ -35,7 +35,7 @@ import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException
 
-import tts as tts_mod
+from . import tts as tts_mod
 
 sys.path.insert(0, "/workspace/csm")
 
