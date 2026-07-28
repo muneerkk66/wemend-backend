@@ -3,10 +3,14 @@ WeMendAI voice API — FastAPI, turn-based.
 
 Pipeline:  audio in → faster-whisper (STT) → Gemma 4 (Ollama) → CSM-1B (TTS) → audio out
 
-Turn-based, not streaming, deliberately: CSM-1B measured 0.43x realtime on the
-RTX 4090, so audio cannot be produced faster than it is consumed. See
-docs/LATENCY.md. The client records a full utterance, uploads it, polls, then
-plays the reply.
+Turn-based, not streaming, deliberately: CSM measured 0.43x realtime on the RTX 4090
+and 0.47-0.53x on Blackwell, so audio cannot be produced faster than it is consumed.
+See docs/LATENCY.md.
+
+Routers are split so the identity half never imports this module's ML holder:
+`routers/auth.py` must keep answering while the GPU pod is stopped, otherwise sign-in
+and account deletion break every night. `routers/voice.py` owns the endpoints that do
+need the models, and reaches back into this module late.
 
 Models are loaded ONCE at startup and held in VRAM (whisper ~2GB + CSM ~4.2GB;
 Gemma lives in the Ollama process, ~4.8GB). Loading CSM costs ~52s, so never
@@ -21,21 +25,15 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import secrets
-import subprocess
 import sys
-import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Literal
 
 import httpx
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
 
 import tts as tts_mod
 
@@ -100,78 +98,7 @@ class Models:
 M = Models()
 
 
-# ─────────────────────────────── session state ──────────────────────────────
-@dataclass
-class Turn:
-    role: Literal["user", "assistant"]
-    text: str
-
-
-@dataclass
-class Session:
-    id: str
-    speaker: str
-    listener: str
-    # Bearer secret returned once at creation and required by every other endpoint.
-    # A stopgap until Phase 1 replaces it with real Apple-backed auth: it stops the
-    # session id alone (which appears in URLs and logs) from granting access.
-    secret: str = field(default_factory=lambda: secrets.token_urlsafe(32))
-    turns: list[Turn] = field(default_factory=list)
-    # Set when the speaker's side is distilled and awaiting their approval.
-    pending_relay: dict | None = None
-    # Audio ids this session produced. /audio is scoped to this set, so a guessed
-    # id no longer yields another person's relay audio.
-    audio_ids: set[str] = field(default_factory=set)
-    created: float = field(default_factory=time.time)
-
-
-SESSIONS: dict[str, Session] = {}
-
-
-# ────────────────────────────────── auth ────────────────────────────────────
-def authed_session(
-    session_id: str = Form(...),
-    authorization: str | None = Header(None),
-) -> Session:
-    """Resolve a session from its id AND its bearer secret.
-
-    Every mutating endpoint depends on this. Previously they took a bare
-    session_id, so anyone holding an id could read another person's pending relay
-    draft and voice it. Compared with compare_digest to avoid leaking the secret
-    through timing.
-    """
-    s = SESSIONS.get(session_id)
-    token = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-    # Same error whether the session is unknown or the secret is wrong — a
-    # distinguishable 404 would confirm which session ids exist.
-    if s is None or not token or not secrets.compare_digest(token, s.secret):
-        raise HTTPException(403, "invalid session or token")
-    return s
-
-
-def register_audio(s: Session, audio_id: str) -> None:
-    s.audio_ids.add(audio_id)
-
-
 # ────────────────────────────────── helpers ─────────────────────────────────
-def transcode_to_wav(raw: bytes, suffix: str) -> str:
-    """iOS sends m4a/aac. Whisper wants a file ffmpeg can read; normalise to 16k mono wav."""
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(raw)
-        src = f.name
-    dst = src + ".wav"
-    r = subprocess.run(
-        ["ffmpeg", "-nostdin", "-y", "-i", src, "-ar", "16000", "-ac", "1", dst],
-        capture_output=True,
-    )
-    os.unlink(src)
-    if r.returncode != 0:
-        raise HTTPException(400, f"could not decode audio: {r.stderr.decode()[-300:]}")
-    return dst
-
-
 async def llm(system: str, user: str, *, json_mode: bool) -> str:
     body = {
         "model": LLM_MODEL,
@@ -223,6 +150,20 @@ app = FastAPI(title="WeMendAI Voice API")
 # from any web page. Add a narrow allowlist here if a browser client ever exists.
 
 
+# Routers. Auth first so it is obvious it does not depend on the models.
+from .routers import auth as auth_router      # noqa: E402
+from .routers import voice as voice_router    # noqa: E402
+
+app.include_router(auth_router.router)
+app.include_router(voice_router.router)
+
+# Authentication is default-deny by construction: every route in the routers above
+# declares Depends(current_user) except the explicit exceptions here (/health and
+# /auth/apple). The pre-auth service had four IDOR-able endpoints precisely because
+# authentication was opt-in per endpoint.
+PUBLIC_PATHS = {"/health", "/auth/apple", "/docs", "/openapi.json"}
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     # Load in a thread so uvicorn can bind the port and answer /health immediately;
@@ -241,142 +182,3 @@ async def health() -> dict:
     }
 
 
-@app.post("/session")
-async def create_session(speaker: str = Form(...), listener: str = Form(...)) -> dict:
-    s = Session(id=uuid.uuid4().hex, speaker=speaker, listener=listener)
-    SESSIONS[s.id] = s
-    # The secret is returned exactly once. Clients must send it as
-    # `Authorization: Bearer <secret>` on every other call.
-    return {"session_id": s.id, "session_secret": s.secret,
-            "speaker": s.speaker, "listener": s.listener}
-
-
-@app.post("/turn")
-async def turn(
-    audio: UploadFile = File(...),
-    voice: str = Form(None),
-    s: Session = Depends(authed_session),
-) -> JSONResponse:
-    """One conversational turn: the speaker talks to the AI, the AI answers aloud."""
-    if not M.ready:
-        raise HTTPException(503, "models still loading — poll /health")
-
-    raw = await audio.read()
-    suffix = os.path.splitext(audio.filename or "a.m4a")[1] or ".m4a"
-    wav = transcode_to_wav(raw, suffix)
-
-    t0 = time.time()
-    segments, info = M.stt.transcribe(wav, language="en", vad_filter=True)
-    heard = " ".join(seg.text for seg in segments).strip()
-    stt_s = time.time() - t0
-    os.unlink(wav)
-
-    if not heard:
-        raise HTTPException(422, "no speech detected")
-
-    s.turns.append(Turn("user", heard))
-
-    history = "\n".join(f"{'Them' if t.role=='user' else 'You'}: {t.text}" for t in s.turns[-8:])
-    t1 = time.time()
-    reply = (await llm(LISTEN_SYSTEM.format(speaker=s.speaker), history, json_mode=False)).strip()
-    llm_s = time.time() - t1
-    s.turns.append(Turn("assistant", reply))
-
-    aid, dur, tstats = await speak(reply, 0, voice)
-    register_audio(s, aid)
-
-    return JSONResponse({
-        "heard": heard,
-        "reply_text": reply,
-        "audio_url": f"/audio/{aid}",
-        "audio_seconds": round(dur, 2),
-        "tts": tstats,
-        "timing_ms": {
-            "stt": int(stt_s * 1000),
-            "llm": int(llm_s * 1000),
-            "tts": tstats["gen_ms"],
-            "total": int((time.time() - t0) * 1000),
-        },
-    })
-
-
-@app.post("/distill")
-async def distill(s: Session = Depends(authed_session)) -> dict:
-    """Shuttle step: turn this speaker's session into a message for the partner.
-
-    Returns the draft WITHOUT voicing it. The speaker must approve via /approve —
-    that consent gate is a product requirement, not an implementation detail.
-    """
-    if not M.ready:
-        raise HTTPException(503, "models still loading")
-
-    said = " ".join(t.text for t in s.turns if t.role == "user")
-    if not said:
-        raise HTTPException(422, "nothing said yet in this session")
-
-    import json
-    raw = await llm(
-        RELAY_SYSTEM.format(speaker=s.speaker, listener=s.listener),
-        f"{s.speaker} said: {said}",
-        json_mode=True,
-    )
-    try:
-        d = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(502, f"llm returned non-JSON: {raw[:300]}")
-
-    # Cheap guard against the perspective-flip failure mode (see prompts/relay_distill.md).
-    relay = str(d.get("relay", ""))
-    flipped = any(p in relay.lower() for p in (" i feel", "i am ", "i'm ", "when you "))
-    d["_perspective_warning"] = flipped
-
-    s.pending_relay = d
-    return {"session_id": s.id, "draft": d, "requires_approval": True}
-
-
-@app.post("/approve")
-async def approve(edited_relay: str = Form(None), voice: str = Form(None),
-                  s: Session = Depends(authed_session)) -> dict:
-    """Speaker approves (optionally edits) the relay; only then is it voiced."""
-    if s.pending_relay is None:
-        raise HTTPException(404, "no pending relay for this session")
-
-    text = (edited_relay or s.pending_relay["relay"]).strip()
-    aid, dur, tstats = await speak(text, 1, voice)   # distinct voice for the relay
-    register_audio(s, aid)
-    s.pending_relay = None
-    return {"relay_text": text, "audio_url": f"/audio/{aid}",
-            "audio_seconds": round(dur, 2), "tts": tstats}
-
-
-@app.get("/audio/{audio_id}")
-async def get_audio(
-    audio_id: str,
-    session_id: str = "",
-    authorization: str | None = Header(None),
-) -> FileResponse:
-    """Fetch generated audio. Scoped to the session that produced it.
-
-    This was the sharpest hole in the service: the only check was isalnum(), so any
-    wav ever generated — including approved relay audio — was readable by guessing a
-    32-hex id on a public URL. Now the caller must prove they own the session that
-    created it. session_id is a query param because <audio> tags cannot set headers,
-    so the client appends ?session_id=...; the bearer secret still travels in the
-    header and is what actually authorises.
-    """
-    if not audio_id.isalnum():                  # no path traversal
-        raise HTTPException(400, "bad id")
-
-    s = SESSIONS.get(session_id)
-    token = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-    if s is None or not token or not secrets.compare_digest(token, s.secret):
-        raise HTTPException(403, "invalid session or token")
-    if audio_id not in s.audio_ids:
-        raise HTTPException(403, "audio does not belong to this session")
-
-    path = os.path.join(AUDIO_DIR, f"{audio_id}.wav")
-    if not os.path.exists(path):
-        raise HTTPException(404, "expired or unknown audio")
-    return FileResponse(path, media_type="audio/wav")
