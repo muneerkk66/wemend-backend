@@ -36,6 +36,41 @@ the relay message is delivered in a *separate later session*, so a 25 s synthesi
 during the cooling-off gap is invisible — and that message is exactly where warmth
 and prosody matter most. Use CSM there; use something fast for live turns.
 
+## CSM voice consistency — pin it with a reference context
+
+CSM is a *conversational* model: it infers speaker identity from context, so
+`generate(context=[])` invents a new voice on every call. Measured timbre
+similarity (cosine of mean-MFCC) across three generations of the same line:
+
+| Context | Pairwise similarity | Result |
+|---|---|---|
+| `[]` | **0.893** (0.837–0.979) | audibly drifts between turns |
+| Fixed 8s reference | **0.997** (0.996–0.997) | stable |
+
+Costs nothing: 0.40× realtime either way, because generation dominates and 8 s of
+prefill is negligible. The reference is `prompts/conversational_a.wav` from the
+model repo, trimmed to 8 s; its transcript was produced with faster-whisper (the
+`Segment` text must match the audio or conditioning degrades).
+
+## Ollama: keep model blobs on local disk
+
+`OLLAMA_MODELS` on the MooseFS volume vs the container disk:
+
+| Blob location | Warm TTFT |
+|---|---|
+| `/workspace` (MooseFS) | 1785 ms |
+| `/opt` (container disk) | **1090 ms** |
+
+~40% off, for a `cp`. Same root cause as the venv and the SIGPIPE — llama.cpp mmaps
+the GGUF, and page faults over the network are expensive.
+
+### A lighter model does NOT help
+
+Measured on the identical stack: `llama3.2:3b` gives **1707 ms** TTFT vs Gemma 4
+E4B's **1785 ms**. Gemma's actual generation is only ~200–370 ms; the rest is
+serving overhead every model pays. Shrinking the model trades real quality for a
+few percent. A bigger GPU doesn't help either — the overhead isn't GPU compute.
+
 ## Speech-to-text
 
 faster-whisper `large-v3-turbo`, `int8_float16`: **~520–970 ms** for an 8 s clip.
