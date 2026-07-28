@@ -58,15 +58,35 @@ class CSMEngine:
 
     name = "csm"
 
-    # Sesame ships speaker prompts in the model repo. conversational_a is warm and
-    # unhurried, which suits a mediator.
-    REF_FILE = "prompts/conversational_a.wav"
-    REF_SECONDS = 8            # enough to fix timbre, cheap in context
-    # Transcript of the first 8s, produced by transcribing the clip with
-    # faster-whisper. It must match the audio or conditioning degrades.
-    REF_TEXT = ("like revising for an exam I'd have to try and like keep up the "
-                "momentum because I'd start really early I'd be like okay I'm "
-                "gonna start revising now and then like")
+    # Sesame ships six speaker prompts in the model repo. CSM clones speaking
+    # STYLE as well as timbre, so the choice matters more than it looks:
+    # the two `conversational_*` clips are filler-heavy ("like ... like ...")
+    # and produce a mumbly, unclear mediator. The `read_speech_*` clips are
+    # articulate. Transcripts below were produced with faster-whisper — the
+    # Segment text must match the audio or conditioning degrades.
+    REF_PROMPTS = {
+        "read_speech_c": (          # default: calm, measured, unhurried
+            "All passed so quickly. There was so much going on around him. "
+            "The tree quite forgot to look to himself."),
+        "read_speech_d": (          # warm, intimate, relational
+            "Suddenly, I was back in the old days before you felt we ought to "
+            "drift apart. It was some trick, the way your eyebrows raise."),
+        "read_speech_a": (
+            "And Lake turned round upon me, a little abruptly, with his odd "
+            "yellowish eyes, a little like"),
+        "read_speech_b": (
+            "He was such a big boy that he wore high boots and carried a jackknife."),
+        "conversational_a": (       # NOT recommended — filler-heavy, unclear
+            "like revising for an exam I'd have to try and like keep up the "
+            "momentum because I'd start really early I'd be like okay I'm gonna "
+            "start revising now and then like"),
+        "conversational_b": (       # NOT recommended
+            "like a super mario level like it's very like high detail and like "
+            "once you get into the park"),
+    }
+    # Override with CSM_VOICE=<key> to A/B without touching code.
+    REF_NAME = os.environ.get("CSM_VOICE", "read_speech_c")
+    REF_SECONDS = 10           # trimmed on a sentence boundary, see below
 
     def __init__(self) -> None:
         import glob
@@ -85,16 +105,21 @@ class CSMEngine:
             "/hub/models--sesame--csm-1b/snapshots/*"))
         if not snaps:
             raise RuntimeError("csm-1b snapshot not found; run bootstrap phase2")
-        wav, sr = torchaudio.load(os.path.join(snaps[0], self.REF_FILE))
+        if self.REF_NAME not in self.REF_PROMPTS:
+            raise ValueError(f"CSM_VOICE={self.REF_NAME!r} unknown; "
+                             f"choose one of {sorted(self.REF_PROMPTS)}")
+        ref_text = self.REF_PROMPTS[self.REF_NAME]
+        wav, sr = torchaudio.load(
+            os.path.join(snaps[0], "prompts", f"{self.REF_NAME}.wav"))
         ref = torchaudio.functional.resample(
             wav.mean(0), sr, self.sample_rate)[: self.REF_SECONDS * self.sample_rate]
-        self._context = [Segment(text=self.REF_TEXT, speaker=0, audio=ref)]
+        self._context = [Segment(text=ref_text, speaker=0, audio=ref)]
 
         # First generation is ~3x slower than steady state; burn it at load.
         self._g.generate(text="Ready.", speaker=0, context=self._context,
                          max_audio_length_ms=2000)
         print(f"[tts:csm] ready in {time.time()-t0:.1f}s "
-              f"(voice pinned to {self.REF_FILE}) "
+              f"(voice={self.REF_NAME}) "
               f"VRAM {torch.cuda.memory_allocated()/2**30:.2f}GB", flush=True)
 
     def synth(self, text: str, speaker: int = 0) -> np.ndarray:

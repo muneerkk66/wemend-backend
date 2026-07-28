@@ -47,10 +47,28 @@ similarity (cosine of mean-MFCC) across three generations of the same line:
 | `[]` | **0.893** (0.837–0.979) | audibly drifts between turns |
 | Fixed 8s reference | **0.997** (0.996–0.997) | stable |
 
-Costs nothing: 0.40× realtime either way, because generation dominates and 8 s of
-prefill is negligible. The reference is `prompts/conversational_a.wav` from the
-model repo, trimmed to 8 s; its transcript was produced with faster-whisper (the
-`Segment` text must match the audio or conditioning degrades).
+Costs nothing: 0.40× realtime either way, because generation dominates and ~10 s of
+prefill is negligible.
+
+### Which reference — CSM clones *style*, not just timbre
+
+This matters more than it looks. Sesame ships six prompts, and the two
+`conversational_*` clips are filler-heavy:
+
+> *"**like** revising for an exam I'd have to try and **like** keep up the momentum…
+> I'd be **like** okay… and then **like**"*
+
+Pinning to that produced a mumbly, unclear mediator — the delivery was cloned along
+with the voice. The four `read_speech_*` clips are articulate and work far better.
+
+Default is **`read_speech_c`** (calm, measured: *"All passed so quickly. There was so
+much going on around him."*). `read_speech_d` is a warmer alternative. Switch with
+`CSM_VOICE=<key>` — no code change.
+
+Trim on a **sentence boundary**, not a fixed offset. The first attempt cut
+`conversational_a` mid-phrase (ending "and then like"), which conditions badly.
+Transcripts are pre-computed with faster-whisper; the `Segment` text must match the
+audio or conditioning degrades.
 
 ## Ollama: keep model blobs on local disk
 
